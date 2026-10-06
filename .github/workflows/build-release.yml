@@ -118,12 +118,13 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.event.client_payload.tag }}"
+          repo="gosianmedia/gosian-media-video-batcher-releases"
           if [ "${{ matrix.label }}" = "macOS arm64" ]; then
             src=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -name "*.dmg" | head -n 1)
             cp "$src" "VideoBatcherStudio-macOS.dmg"
-            gh release upload "$tag" "VideoBatcherStudio-macOS.dmg" --clobber
+            gh release upload "$tag" "VideoBatcherStudio-macOS.dmg" --repo "$repo" --clobber
           else
             src=$(find src-tauri/target/release/bundle/nsis -name "*-setup.exe" | head -n 1)
             cp "$src" "VideoBatcherStudio-Windows.exe"
-            gh release upload "$tag" "VideoBatcherStudio-Windows.exe" --clobber
+            gh release upload "$tag" "VideoBatcherStudio-Windows.exe" --repo "$repo" --clobber
           fi
