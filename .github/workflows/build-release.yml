@@ -1,0 +1,129 @@
+name: Build and publish release
+
+# Runs on the PUBLIC releases repo so macOS/Windows CI minutes are free and
+# unlimited. The private source repo is checked out with SOURCE_TOKEN, so the
+# source code itself never becomes public.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.4)"
+        required: true
+  repository_dispatch:
+    types: [release]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64
+            platform: windows-latest
+            args: "--bundles nsis"
+            rust_targets: ""
+          - label: macOS arm64
+            platform: macos-latest
+            args: "--bundles app,dmg --target aarch64-apple-darwin --verbose"
+            rust_targets: "aarch64-apple-darwin"
+    runs-on: ${{ matrix.platform }}
+    # Apple's notary service can be slow for new Developer ID accounts.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: gosianmedia/gosian-media-video-batcher
+          ref: ${{ inputs.tag || github.event.client_payload.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Write App Store Connect API key
+        shell: bash
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$RUNNER_TEMP/AuthKey.p8"
+
+      # Import the Developer ID certificate into a temporary keychain that is
+      # unlocked for codesign (set-key-partition-list prevents a keychain
+      # permission prompt that can never be answered in CI).
+      - name: Import Apple Developer Certificate
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          echo "$APPLE_CERTIFICATE" | base64 -D > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security find-identity -v -p codesigning build.keychain
+          rm -f certificate.p12
+
+      - name: Build Tauri app (bundles + updater artifacts)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing — REQUIRED for signed auto-updates (all platforms).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS Developer ID signing + notarization.
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
+        with:
+          releaseCommitish: main
+          tagName: ${{ inputs.tag || github.event.client_payload.tag }}
+          releaseName: "Video Batcher Studio ${{ inputs.tag || github.event.client_payload.tag }}"
+          releaseBody: "See the release notes in the repository."
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
+      # Stable, version-less download names used by the install page. These URLs
+      # never change, so the website links keep working across releases:
+      #   .../releases/latest/download/VideoBatcherStudio-macOS.dmg
+      #   .../releases/latest/download/VideoBatcherStudio-Windows.exe
+      - name: Publish stable download aliases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.event.client_payload.tag }}"
+          if [ "${{ matrix.label }}" = "macOS arm64" ]; then
+            src=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -name "*.dmg" | head -n 1)
+            cp "$src" "VideoBatcherStudio-macOS.dmg"
+            gh release upload "$tag" "VideoBatcherStudio-macOS.dmg" --clobber
+          else
+            src=$(find src-tauri/target/release/bundle/nsis -name "*-setup.exe" | head -n 1)
+            cp "$src" "VideoBatcherStudio-Windows.exe"
+            gh release upload "$tag" "VideoBatcherStudio-Windows.exe" --clobber
+          fi
